@@ -21,6 +21,8 @@ import com.nuvio.app.features.player.desktop.DesktopHostOs
 import com.nuvio.app.features.player.desktop.DesktopPlayerLaunchShield
 import com.nuvio.app.features.player.desktop.NativePlayerController
 import com.nuvio.app.features.player.desktop.NativePlayerHost
+import java.awt.event.KeyAdapter
+import java.awt.event.KeyEvent
 import kotlinx.coroutines.delay
 
 @Composable
@@ -45,7 +47,7 @@ actual fun PlatformPlayerSurface(
     onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
     onError: (String?) -> Unit,
 ) {
-    if (DesktopHostOs.current == DesktopHostOs.MACOS || DesktopHostOs.current == DesktopHostOs.WINDOWS) {
+    if (isDesktopNativePlaybackViable()) {
         NativePlayerSurface(
             sourceUrl = sourceUrl,
             sourceHeaders = sourceHeaders,
@@ -70,6 +72,21 @@ actual fun PlatformPlayerSurface(
         onControllerReady = onControllerReady,
         onSnapshot = onSnapshot,
     )
+}
+
+private fun isDesktopNativePlaybackViable(): Boolean =
+    when (DesktopHostOs.current) {
+        DesktopHostOs.MACOS, DesktopHostOs.WINDOWS -> true
+        DesktopHostOs.LINUX -> isLinuxX11PlaybackViable()
+        else -> false
+    }
+
+// mpv `wid` embedding needs an X11 drawable. AWT provides one on native X11 and
+// on Wayland via XWayland (sun.awt.X11.XToolkit). A native-Wayland JVM (WLToolkit)
+// has no X11 drawable, so we fall back to the stub until the render-API path lands.
+private fun isLinuxX11PlaybackViable(): Boolean {
+    val toolkit = runCatching { java.awt.Toolkit.getDefaultToolkit().javaClass.name }.getOrNull()
+    return toolkit == "sun.awt.X11.XToolkit" && !System.getenv("DISPLAY").isNullOrBlank()
 }
 
 @Composable
@@ -140,6 +157,28 @@ private fun NativePlayerSurface(
 
     DisposableEffect(controller, sourceUrl, playbackHeaders) {
         onDispose { controller.dispose() }
+    }
+
+    // Phase 1 Linux input layer: the HTML controls overlay (and its input path)
+    // is not present on Linux yet, so attach a minimal keyboard handler to the
+    // focus-owning Canvas. On macOS/Windows input still flows through the webview.
+    if (DesktopHostOs.current == DesktopHostOs.LINUX) {
+        DisposableEffect(controller, host) {
+            val keyListener = object : KeyAdapter() {
+                override fun keyPressed(event: KeyEvent) {
+                    when (event.keyCode) {
+                        KeyEvent.VK_SPACE, KeyEvent.VK_K ->
+                            if (controller.snapshot().isPlaying) controller.pause() else controller.play()
+                        KeyEvent.VK_LEFT -> controller.seekBy(-10_000L)
+                        KeyEvent.VK_RIGHT -> controller.seekBy(10_000L)
+                    }
+                }
+            }
+            host.isFocusable = true
+            host.addKeyListener(keyListener)
+            host.requestFocusInWindow()
+            onDispose { host.removeKeyListener(keyListener) }
+        }
     }
 
     LaunchedEffect(controller, sourceUrl, playbackHeaders, hostFirstFullSizePaintComplete.value) {

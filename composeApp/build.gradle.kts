@@ -739,6 +739,42 @@ abstract class GenerateNativeRuntimeIndexTask : DefaultTask() {
     }
 }
 
+val linuxPlayerBridgeSource = layout.projectDirectory.file("src/desktopMain/native/linux/player_bridge.cpp")
+val linuxPlayerBridgeOutput = layout.buildDirectory.file("native/linux/libplayer_bridge.so")
+val linuxPlayerBridgeJavaHome = providers.systemProperty("java.home").get()
+if (isLinuxHost) {
+    linuxPlayerBridgeOutput.get().asFile.parentFile.mkdirs()
+}
+// libmpv is dlopen'd at runtime by the bridge, so it is NOT linked here. JNI headers
+// come from the full JDK running Gradle (the jlink'd jpackage runtime has none).
+// Phase 1 relies on the system libmpv (libmpv.so.2); bundling is a later phase.
+val linuxPlayerBridgeCommand = listOf(
+    "/bin/sh",
+    "-c",
+    """
+    set -eu
+    exec g++ \
+      -std=c++17 \
+      -shared \
+      -fPIC \
+      -Wl,-soname,libplayer_bridge.so \
+      ${shellQuote(linuxPlayerBridgeSource.asFile.absolutePath)} \
+      -o ${shellQuote(linuxPlayerBridgeOutput.get().asFile.absolutePath)} \
+      -I${shellQuote("$linuxPlayerBridgeJavaHome/include")} \
+      -I${shellQuote("$linuxPlayerBridgeJavaHome/include/linux")} \
+      -lX11 \
+      -ldl \
+      -lpthread
+    """.trimIndent(),
+)
+val buildLinuxPlayerBridge = tasks.register<Exec>("buildLinuxPlayerBridge") {
+    notCompatibleWithConfigurationCache("Builds a host-local player bridge against libmpv for Linux.")
+    enabled = isLinuxHost
+    inputs.file(linuxPlayerBridgeSource)
+    outputs.file(linuxPlayerBridgeOutput)
+    commandLine(linuxPlayerBridgeCommand)
+}
+
 tasks.withType<Jar>().configureEach {
     if (isMacHost && name == "desktopJar") {
         dependsOn(buildMacosPlayerBridge)
@@ -753,6 +789,12 @@ tasks.withType<Jar>().configureEach {
         }
         from(windowsPlayerRuntimeOutput) {
             into("native/windows")
+        }
+    }
+    if (isLinuxHost && name == "desktopJar") {
+        dependsOn(buildLinuxPlayerBridge)
+        from(linuxPlayerBridgeOutput) {
+            into("native/linux")
         }
     }
 }
@@ -782,6 +824,34 @@ if (isWindowsHost) {
     )
     tasks.matching { it.name in desktopNativePlayerTasks }.configureEach {
         dependsOn(buildWindowsPlayerBridge, prepareWindowsPlayerRuntime, generateWindowsPlayerRuntimeIndex)
+    }
+}
+
+if (isLinuxHost) {
+    val desktopNativePlayerTasks = setOf(
+        "run",
+        "runRelease",
+        "desktopRun",
+        "runDistributable",
+        "runReleaseDistributable",
+        "desktopRunHot",
+        "hotRunDesktop",
+        "hotRunDesktopAsync",
+        "hotDevDesktop",
+        "hotDevDesktopAsync",
+        "createDistributable",
+        "createReleaseDistributable",
+        "createRuntimeImage",
+        "package",
+        "packageDistributionForCurrentOS",
+        "packageDeb",
+        "packageReleaseDeb",
+        "packageUberJarForCurrentOS",
+        "packageReleaseDistributionForCurrentOS",
+        "packageReleaseUberJarForCurrentOS",
+    )
+    tasks.matching { it.name in desktopNativePlayerTasks }.configureEach {
+        dependsOn(buildLinuxPlayerBridge)
     }
 }
 
@@ -916,6 +986,15 @@ compose.desktop {
             "--add-opens=java.desktop/sun.awt.windows=ALL-UNNAMED",
             smokePlayerUrl?.takeIf { it.isNotBlank() }?.let { "-Dnuvio.desktop.smokePlayerUrl=$it" },
         )
+        // Linux: pin the X11/XWayland AWT toolkit so the player Canvas owns a real
+        // X11 window id for mpv `wid` embedding (newer JBR defaults to native Wayland),
+        // and open sun.awt.X11 so the resolver can read it reflectively.
+        if (isLinuxHost) {
+            jvmArgs += listOf(
+                "--add-opens=java.desktop/sun.awt.X11=ALL-UNNAMED",
+                "-Dawt.toolkit.name=XToolkit",
+            )
+        }
 
         nativeDistributions {
             targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
