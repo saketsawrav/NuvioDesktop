@@ -918,7 +918,7 @@ compose.desktop {
         )
 
         nativeDistributions {
-            targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb, TargetFormat.Rpm, TargetFormat.AppImage)
+            targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
             packageName = "Nuvio"
             packageVersion = desktopReleasePackageVersion
             vendor = "Nuvio Media"
@@ -1091,41 +1091,141 @@ if (isMacHost) {
 
 // ==================== Linux Packaging Tasks ====================
 
-// AppImage with update info
-tasks.register("packageAppImageWithUpdate") {
-    dependsOn("createReleaseDistributable")
-    doLast {
-        val appDir = layout.buildDirectory.dir("compose/binaries/main/app/Nuvio").get().asFile
-        if (!appDir.isDirectory) {
-            logger.warn("AppImage: distribution dir not found at ${appDir.absolutePath}")
-            return@doLast
+// Assembles a Linux AppImage from the release app-image produced by jpackage
+// (createReleaseDistributable). jpackage emits bin/Nuvio + lib/Nuvio.png but no
+// AppRun/.desktop/icon at the root, all of which appimagetool requires, so this
+// task adds them before invoking appimagetool. Configuration-cache safe: it uses
+// an injected ExecOperations and typed inputs, mirroring NotarizeMacosDmgWithKeychainTask.
+abstract class PackageLinuxAppImageTask @Inject constructor(
+    private val execOperations: ExecOperations,
+) : DefaultTask() {
+    @get:InputDirectory
+    abstract val appImageDir: DirectoryProperty
+
+    @get:InputFile
+    abstract val fallbackIcon: RegularFileProperty
+
+    @get:OutputDirectory
+    abstract val outputDir: DirectoryProperty
+
+    @get:Input
+    abstract val packageVersion: Property<String>
+
+    @get:Input
+    abstract val arch: Property<String>
+
+    @get:Input
+    abstract val updateInfo: Property<String>
+
+    init {
+        outputs.upToDateWhen { false }
+    }
+
+    @TaskAction
+    fun packageAppImage() {
+        val appDir = appImageDir.get().asFile
+        require(appDir.isDirectory) {
+            "AppImage: app-image not found at ${appDir.absolutePath}. " +
+                "Run :composeApp:createReleaseDistributable on a Linux host first."
         }
-        val appRun = appDir.resolve("AppRun")
+
+        val appimagetool = resolveAppimagetool()
+            ?: throw GradleException(
+                "appimagetool not found on PATH. Install it, e.g.:\n" +
+                    "  wget -O appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage\n" +
+                    "  chmod +x appimagetool && sudo mv appimagetool /usr/local/bin/\n" +
+                    "then re-run. See https://github.com/AppImage/appimagetool."
+            )
+
+        // 1) AppRun entry point -> launches the jpackage launcher at bin/Nuvio.
+        val appRun = File(appDir, "AppRun")
         appRun.writeText(
             "#!/bin/sh\n" +
-            "HERE=\"\$(dirname \"\$(readlink -f \"\${0}\")\")\"\n" +
-            "cd \"\${HERE}\" || exit 1\n" +
-            "exec \"\${HERE}/bin/Nuvio\" \"\$@\"\n"
+                "HERE=\"\$(dirname \"\$(readlink -f \"\$0\")\")\"\n" +
+                "exec \"\$HERE/bin/Nuvio\" \"\$@\"\n"
         )
         appRun.setExecutable(true)
 
-        val outputDir = layout.buildDirectory.dir("compose/binaries/main/appimage").get().asFile
-        outputDir.mkdirs()
-        val appImageFile = outputDir.resolve("Nuvio-${desktopReleasePackageVersion}-x86_64.AppImage")
-        val updateStr = "gh-releases-zsync|${project.findProperty("github.owner") ?: "aelrased"}|${project.findProperty("github.repo") ?: "NuvioDesktop"}|latest|Nuvio-*-x86_64.AppImage.zsync"
-        exec {
+        // 2) Icon at the AppDir root named to match Icon=nuvio (no extension in Icon=).
+        //    Prefer the icon jpackage already placed at lib/Nuvio.png; fall back to source.
+        val launcherIcon = File(appDir, "lib/Nuvio.png")
+        val iconSource = if (launcherIcon.isFile) launcherIcon else fallbackIcon.get().asFile
+        val rootIcon = File(appDir, "nuvio.png")
+        iconSource.copyTo(rootIcon, overwrite = true)
+        // 3) .DirIcon for thumbnailers/file managers.
+        iconSource.copyTo(File(appDir, ".DirIcon"), overwrite = true)
+
+        // 4) Exactly one top-level .desktop file (mandatory keys: Name, Exec, Icon, Type, Categories).
+        File(appDir, "nuvio.desktop").writeText(
+            "[Desktop Entry]\n" +
+                "Type=Application\n" +
+                "Name=Nuvio\n" +
+                "Exec=Nuvio\n" +
+                "Icon=nuvio\n" +
+                "Categories=AudioVideo;Player;\n" +
+                "Comment=A desktop media app\n" +
+                "Terminal=false\n"
+        )
+
+        val out = outputDir.get().asFile
+        out.mkdirs()
+        val archToken = arch.get()
+        val appImageFile = File(out, "Nuvio-${packageVersion.get()}-$archToken.AppImage")
+
+        execOperations.exec {
+            // ARCH must be set so appimagetool labels the artifact correctly; the
+            // extract-and-run flag lets appimagetool itself run on hosts without FUSE.
+            environment("ARCH", archToken)
+            environment("APPIMAGE_EXTRACT_AND_RUN", "1")
             commandLine(
-                "appimagetool",
-                "-u", updateStr,
+                appimagetool,
+                "-u", updateInfo.get(),
                 appDir.absolutePath,
                 appImageFile.absolutePath,
             )
         }
+
         logger.lifecycle("AppImage created: ${appImageFile.absolutePath}")
-        val zsyncFile = file("${appImageFile.absolutePath}.zsync")
+        val zsyncFile = File("${appImageFile.absolutePath}.zsync")
         if (zsyncFile.isFile) {
             logger.lifecycle("zsync file: ${zsyncFile.absolutePath}")
         }
+    }
+
+    private fun resolveAppimagetool(): String? {
+        val pathEntries = (System.getenv("PATH") ?: "").split(File.pathSeparator)
+        for (entry in pathEntries) {
+            if (entry.isBlank()) continue
+            val candidate = File(entry, "appimagetool")
+            if (candidate.isFile && candidate.canExecute()) return candidate.absolutePath
+        }
+        return null
+    }
+}
+
+// AppImage update channel points at the official repo by default; override with
+// -Pgithub.owner / -Pgithub.repo for forks.
+val appImageUpdateOwner = (project.findProperty("github.owner") as String?)?.takeIf { it.isNotBlank() } ?: "NuvioMedia"
+val appImageUpdateRepo = (project.findProperty("github.repo") as String?)?.takeIf { it.isNotBlank() } ?: "NuvioDesktop"
+val appImageArch = when (System.getProperty("os.arch").lowercase()) {
+    "amd64", "x86_64" -> "x86_64"
+    "aarch64", "arm64" -> "aarch64"
+    else -> "x86_64"
+}
+val appImageUpdateInfo =
+    "gh-releases-zsync|$appImageUpdateOwner|$appImageUpdateRepo|latest|Nuvio-*-$appImageArch.AppImage.zsync"
+
+if (isLinuxHost) {
+    tasks.register<PackageLinuxAppImageTask>("packageAppImageWithUpdate") {
+        group = "distribution"
+        description = "Builds a Linux AppImage from the release app-image with gh-releases-zsync update info."
+        dependsOn("createReleaseDistributable")
+        appImageDir.set(layout.buildDirectory.dir("compose/binaries/main-release/app/Nuvio"))
+        outputDir.set(layout.buildDirectory.dir("compose/binaries/main-release/appimage"))
+        fallbackIcon.set(project.file("src/desktopMain/resources/icons/nuvio-app-icon.png"))
+        packageVersion.set(desktopReleasePackageVersion)
+        arch.set(appImageArch)
+        updateInfo.set(appImageUpdateInfo)
     }
 }
 
